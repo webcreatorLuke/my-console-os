@@ -1,372 +1,695 @@
-#include <stdint.h>
-#include <string.h>
-#include <stdbool.h>
+#include "oscode.h"
+#include "oscode2.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
-// File system constants
-#define BLOCK_SIZE 512
-#define MAX_FILENAME 64
-#define MAX_FILES 1024
-#define MAX_PATH 256
-#define FS_MAGIC 0x434F4E53  // "CONS" in hex
+// Game system constants
+#define MAX_GAMES 256
+#define MAX_GAME_NAME 64
+#define MAX_SAVE_SLOTS 10
+#define GAME_SIGNATURE 0x47414D45  // "GAME" in hex
+#define SAVE_SIGNATURE 0x53415645  // "SAVE" in hex
 
-// File types
+// Game states
 typedef enum {
-    FILE_TYPE_REGULAR = 0,
-    FILE_TYPE_DIRECTORY = 1,
-    FILE_TYPE_GAME = 2,
-    FILE_TYPE_SAVE = 3
-} file_type_t;
+    GAME_STATE_STOPPED = 0,
+    GAME_STATE_LOADING = 1,
+    GAME_STATE_RUNNING = 2,
+    GAME_STATE_PAUSED = 3,
+    GAME_STATE_SAVING = 4,
+    GAME_STATE_ERROR = 5
+} game_state_t;
 
-// File attributes
-typedef struct {
-    uint32_t size;
-    uint32_t created_time;
-    uint32_t modified_time;
-    uint32_t accessed_time;
-    uint16_t permissions;
-    uint8_t type;
-    uint8_t flags;
-} file_attr_t;
+// Game types
+typedef enum {
+    GAME_TYPE_ARCADE = 0,
+    GAME_TYPE_PUZZLE = 1,
+    GAME_TYPE_PLATFORM = 2,
+    GAME_TYPE_SHOOTER = 3,
+    GAME_TYPE_RPG = 4,
+    GAME_TYPE_HOMEBREW = 5
+} game_type_t;
 
-// Directory entry
+// Game header structure
 typedef struct {
-    char name[MAX_FILENAME];
-    uint32_t inode;
-    file_attr_t attributes;
-    uint32_t first_block;
-    uint32_t next_entry;  // For linked directory entries
-} dir_entry_t;
-
-// Inode structure
-typedef struct {
-    uint32_t inode_num;
-    file_attr_t attributes;
-    uint32_t blocks[12];      // Direct blocks
-    uint32_t indirect_block;  // Single indirect
-    uint32_t double_indirect; // Double indirect
-    uint32_t block_count;
-} inode_t;
-
-// Superblock - file system metadata
-typedef struct {
-    uint32_t magic;
+    uint32_t signature;
     uint32_t version;
-    uint32_t block_size;
-    uint32_t total_blocks;
-    uint32_t free_blocks;
-    uint32_t total_inodes;
-    uint32_t free_inodes;
-    uint32_t root_inode;
-    uint32_t bitmap_blocks;
-    uint32_t inode_table_blocks;
-    uint32_t first_data_block;
-    char volume_name[32];
-} superblock_t;
+    char name[MAX_GAME_NAME];
+    char author[32];
+    game_type_t type;
+    uint32_t code_size;
+    uint32_t data_size;
+    uint32_t required_memory;
+    uint32_t entry_point;
+    uint32_t save_data_size;
+    uint32_t checksum;
+} game_header_t;
 
-// File system context
+// Save game structure
 typedef struct {
-    superblock_t sb;
-    uint8_t* block_bitmap;
-    uint8_t* inode_bitmap;
-    inode_t* inode_table;
-    uint8_t* data_blocks;
-    uint32_t current_directory;
-} fs_context_t;
+    uint32_t signature;
+    uint32_t game_checksum;
+    uint32_t save_time;
+    uint32_t play_time;
+    uint32_t level;
+    uint32_t score;
+    uint32_t data_size;
+    uint8_t save_data[4096];  // Game-specific save data
+} save_game_t;
 
-// File handle
+// Game instance
 typedef struct {
-    uint32_t inode;
-    uint32_t position;
-    uint8_t mode;  // read/write flags
-    bool is_open;
-} file_handle_t;
+    game_header_t header;
+    uint32_t process_id;
+    game_state_t state;
+    void* code_memory;
+    void* data_memory;
+    void* stack_memory;
+    uint32_t start_time;
+    uint32_t play_time;
+    uint32_t current_level;
+    uint32_t current_score;
+    char save_path[MAX_PATH];
+    bool has_save_data;
+} game_instance_t;
+
+// Game registry entry
+typedef struct {
+    char name[MAX_GAME_NAME];
+    char path[MAX_PATH];
+    game_type_t type;
+    uint32_t size;
+    uint32_t last_played;
+    bool is_installed;
+} game_registry_entry_t;
+
+// Game manager context
+typedef struct {
+    fs_context_t* fs;
+    memory_manager_t* mm;
+    
+    game_instance_t* current_game;
+    game_registry_entry_t registry[MAX_GAMES];
+    uint32_t game_count;
+    
+    // Runtime statistics
+    uint32_t total_games_played;
+    uint32_t total_play_time;
+    uint32_t high_score;
+    
+    // System resources
+    uint32_t max_game_memory;
+    uint32_t available_memory;
+    
+    // Input state (simplified)
+    struct {
+        bool up, down, left, right;
+        bool button_a, button_b, button_start, button_select;
+        int mouse_x, mouse_y;
+        bool mouse_click;
+    } input;
+    
+    // Display buffer (simplified)
+    uint32_t* framebuffer;
+    uint32_t screen_width;
+    uint32_t screen_height;
+    
+} game_manager_t;
+
+// Game function pointer type
+typedef int (*game_main_func)(game_manager_t* gm, void* game_data);
 
 // Function prototypes
-int fs_init(fs_context_t* ctx, uint32_t total_blocks);
-int fs_format(fs_context_t* ctx, const char* volume_name);
-int fs_create_file(fs_context_t* ctx, const char* path, file_type_t type);
-int fs_delete_file(fs_context_t* ctx, const char* path);
-file_handle_t* fs_open(fs_context_t* ctx, const char* path, uint8_t mode);
-int fs_close(file_handle_t* handle);
-int fs_read(fs_context_t* ctx, file_handle_t* handle, void* buffer, uint32_t size);
-int fs_write(fs_context_t* ctx, file_handle_t* handle, const void* buffer, uint32_t size);
-int fs_seek(file_handle_t* handle, uint32_t position);
-int fs_mkdir(fs_context_t* ctx, const char* path);
-int fs_list_directory(fs_context_t* ctx, const char* path, dir_entry_t* entries, uint32_t max_entries);
+int game_system_init(game_manager_t* gm, fs_context_t* fs, memory_manager_t* mm);
+int game_system_shutdown(game_manager_t* gm);
 
-// Block allocation functions
-uint32_t allocate_block(fs_context_t* ctx);
-void free_block(fs_context_t* ctx, uint32_t block);
-uint32_t allocate_inode(fs_context_t* ctx);
-void free_inode(fs_context_t* ctx, uint32_t inode);
+// Game management
+int game_install(game_manager_t* gm, const char* game_path);
+int game_uninstall(game_manager_t* gm, const char* game_name);
+int game_load(game_manager_t* gm, const char* game_name);
+int game_run(game_manager_t* gm);
+int game_pause(game_manager_t* gm);
+int game_resume(game_manager_t* gm);
+int game_stop(game_manager_t* gm);
+
+// Save system
+int game_save(game_manager_t* gm, int slot);
+int game_load_save(game_manager_t* gm, int slot);
+int game_list_saves(game_manager_t* gm, const char* game_name, save_game_t* saves, int max_saves);
+
+// Game registry
+int game_scan_directory(game_manager_t* gm, const char* directory);
+int game_list_installed(game_manager_t* gm, game_registry_entry_t* games, int max_games);
+game_registry_entry_t* game_find_by_name(game_manager_t* gm, const char* name);
+
+// Utility functions
+uint32_t calculate_checksum(void* data, uint32_t size);
+int validate_game_header(game_header_t* header);
+void update_play_time(game_manager_t* gm);
+void game_render_frame(game_manager_t* gm);
+void game_update_input(game_manager_t* gm);
+
+// Built-in demo games
+int demo_game_pong(game_manager_t* gm, void* game_data);
+int demo_game_tetris(game_manager_t* gm, void* game_data);
+int demo_game_snake(game_manager_t* gm, void* game_data);
 
 // Implementation
 
-int fs_init(fs_context_t* ctx, uint32_t total_blocks) {
-    memset(ctx, 0, sizeof(fs_context_t));
+int game_system_init(game_manager_t* gm, fs_context_t* fs, memory_manager_t* mm) {
+    memset(gm, 0, sizeof(game_manager_t));
     
-    // Initialize superblock
-    ctx->sb.magic = FS_MAGIC;
-    ctx->sb.version = 1;
-    ctx->sb.block_size = BLOCK_SIZE;
-    ctx->sb.total_blocks = total_blocks;
-    ctx->sb.free_blocks = total_blocks;
-    ctx->sb.total_inodes = MAX_FILES;
-    ctx->sb.free_inodes = MAX_FILES;
+    gm->fs = fs;
+    gm->mm = mm;
+    gm->max_game_memory = 16 * 1024 * 1024; // 16MB max per game
+    gm->screen_width = 800;
+    gm->screen_height = 600;
     
-    // Calculate layout
-    ctx->sb.bitmap_blocks = (total_blocks + BLOCK_SIZE * 8 - 1) / (BLOCK_SIZE * 8);
-    ctx->sb.inode_table_blocks = (MAX_FILES * sizeof(inode_t) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    ctx->sb.first_data_block = 1 + ctx->sb.bitmap_blocks + 1 + ctx->sb.inode_table_blocks;
+    // Allocate framebuffer
+    gm->framebuffer = (uint32_t*)memory_alloc(mm, 
+        gm->screen_width * gm->screen_height * sizeof(uint32_t), 
+        MEM_TYPE_GRAPHICS);
     
-    // Allocate memory for file system structures
-    ctx->block_bitmap = (uint8_t*)calloc(ctx->sb.bitmap_blocks, BLOCK_SIZE);
-    ctx->inode_bitmap = (uint8_t*)calloc(1, BLOCK_SIZE);
-    ctx->inode_table = (inode_t*)calloc(MAX_FILES, sizeof(inode_t));
-    ctx->data_blocks = (uint8_t*)calloc(total_blocks, BLOCK_SIZE);
-    
-    if (!ctx->block_bitmap || !ctx->inode_bitmap || !ctx->inode_table || !ctx->data_blocks) {
-        return -1; // Memory allocation failed
+    if (!gm->framebuffer) {
+        printf("Failed to allocate framebuffer\n");
+        return -1;
     }
+    
+    // Create games directory if it doesn't exist
+    fs_mkdir(fs, "/games");
+    fs_mkdir(fs, "/saves");
+    
+    // Scan for installed games
+    game_scan_directory(gm, "/games");
+    
+    // Install built-in demo games
+    printf("Installing built-in demo games...\n");
+    
+    // Create demo game entries
+    game_registry_entry_t* pong = &gm->registry[gm->game_count++];
+    strcpy(pong->name, "Pong");
+    strcpy(pong->path, "builtin://pong");
+    pong->type = GAME_TYPE_ARCADE;
+    pong->size = 0;
+    pong->is_installed = true;
+    
+    game_registry_entry_t* tetris = &gm->registry[gm->game_count++];
+    strcpy(tetris->name, "Tetris");
+    strcpy(tetris->path, "builtin://tetris");
+    tetris->type = GAME_TYPE_PUZZLE;
+    tetris->size = 0;
+    tetris->is_installed = true;
+    
+    game_registry_entry_t* snake = &gm->registry[gm->game_count++];
+    strcpy(snake->name, "Snake");
+    strcpy(snake->path, "builtin://snake");
+    snake->type = GAME_TYPE_ARCADE;
+    snake->size = 0;
+    snake->is_installed = true;
+    
+    printf("Game system initialized with %d games\n", gm->game_count);
+    return 0;
+}
+
+int game_load(game_manager_t* gm, const char* game_name) {
+    if (gm->current_game) {
+        printf("Another game is already running. Stop it first.\n");
+        return -1;
+    }
+    
+    // Find game in registry
+    game_registry_entry_t* entry = game_find_by_name(gm, game_name);
+    if (!entry) {
+        printf("Game '%s' not found\n", game_name);
+        return -1;
+    }
+    
+    // Allocate game instance
+    gm->current_game = (game_instance_t*)memory_alloc(gm->mm, 
+        sizeof(game_instance_t), MEM_TYPE_GAME);
+    
+    if (!gm->current_game) {
+        printf("Failed to allocate memory for game instance\n");
+        return -1;
+    }
+    
+    game_instance_t* game = gm->current_game;
+    memset(game, 0, sizeof(game_instance_t));
+    
+    // Handle built-in games
+    if (strncmp(entry->path, "builtin://", 10) == 0) {
+        // Set up built-in game header
+        game->header.signature = GAME_SIGNATURE;
+        game->header.version = 1;
+        strcpy(game->header.name, entry->name);
+        strcpy(game->header.author, "Built-in");
+        game->header.type = entry->type;
+        game->header.code_size = 0;
+        game->header.data_size = 1024; // Small data allocation
+        game->header.required_memory = 64 * 1024; // 64KB
+        game->header.entry_point = 0;
+        game->header.save_data_size = 512;
+        
+        // Allocate memory for built-in game
+        game->data_memory = memory_alloc(gm->mm, game->header.data_size, MEM_TYPE_GAME);
+        if (!game->data_memory) {
+            memory_free(gm->mm, game);
+            gm->current_game = NULL;
+            return -1;
+        }
+        
+        printf("Loaded built-in game: %s\n", game->header.name);
+        game->state = GAME_STATE_LOADING;
+        return 0;
+    }
+    
+    // Load game from file system
+    file_handle_t* game_file = fs_open(gm->fs, entry->path, 0x01); // Read mode
+    if (!game_file) {
+        printf("Failed to open game file: %s\n", entry->path);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    // Read game header
+    if (fs_read(gm->fs, game_file, &game->header, sizeof(game_header_t)) != sizeof(game_header_t)) {
+        printf("Failed to read game header\n");
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    // Validate game header
+    if (validate_game_header(&game->header) != 0) {
+        printf("Invalid game header\n");
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    // Check memory requirements
+    if (game->header.required_memory > gm->max_game_memory) {
+        printf("Game requires too much memory: %d bytes\n", game->header.required_memory);
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    // Allocate memory for game
+    game->code_memory = memory_alloc(gm->mm, game->header.code_size, MEM_TYPE_GAME);
+    game->data_memory = memory_alloc(gm->mm, game->header.data_size, MEM_TYPE_GAME);
+    
+    if (!game->code_memory || !game->data_memory) {
+        printf("Failed to allocate memory for game\n");
+        if (game->code_memory) memory_free(gm->mm, game->code_memory);
+        if (game->data_memory) memory_free(gm->mm, game->data_memory);
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    // Read game code and data
+    if (fs_read(gm->fs, game_file, game->code_memory, game->header.code_size) != game->header.code_size) {
+        printf("Failed to read game code\n");
+        memory_free(gm->mm, game->code_memory);
+        memory_free(gm->mm, game->data_memory);
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    if (fs_read(gm->fs, game_file, game->data_memory, game->header.data_size) != game->header.data_size) {
+        printf("Failed to read game data\n");
+        memory_free(gm->mm, game->code_memory);
+        memory_free(gm->mm, game->data_memory);
+        fs_close(game_file);
+        memory_free(gm->mm, game);
+        gm->current_game = NULL;
+        return -1;
+    }
+    
+    fs_close(game_file);
+    
+    // Set up save path
+    snprintf(game->save_path, MAX_PATH, "/saves/%s", game->header.name);
+    
+    game->state = GAME_STATE_LOADING;
+    game->start_time = time(NULL);
+    
+    printf("Loaded game: %s by %s\n", game->header.name, game->header.author);
+    printf("Memory allocated: Code=%d, Data=%d\n", game->header.code_size, game->header.data_size);
     
     return 0;
 }
 
-int fs_format(fs_context_t* ctx, const char* volume_name) {
-    // Clear bitmaps
-    memset(ctx->block_bitmap, 0, ctx->sb.bitmap_blocks * BLOCK_SIZE);
-    memset(ctx->inode_bitmap, 0, BLOCK_SIZE);
-    memset(ctx->inode_table, 0, MAX_FILES * sizeof(inode_t));
-    
-    // Set volume name
-    strncpy(ctx->sb.volume_name, volume_name, 31);
-    ctx->sb.volume_name[31] = '\0';
-    
-    // Mark system blocks as used
-    for (uint32_t i = 0; i < ctx->sb.first_data_block; i++) {
-        ctx->block_bitmap[i / 8] |= (1 << (i % 8));
-        ctx->sb.free_blocks--;
+int game_run(game_manager_t* gm) {
+    if (!gm->current_game) {
+        printf("No game loaded\n");
+        return -1;
     }
     
-    // Create root directory
-    ctx->sb.root_inode = allocate_inode(ctx);
-    inode_t* root = &ctx->inode_table[ctx->sb.root_inode];
-    root->inode_num = ctx->sb.root_inode;
-    root->attributes.type = FILE_TYPE_DIRECTORY;
-    root->attributes.permissions = 0755;
-    root->attributes.size = 0;
-    root->blocks[0] = allocate_block(ctx);
-    root->block_count = 1;
+    game_instance_t* game = gm->current_game;
     
-    ctx->current_directory = ctx->sb.root_inode;
-    
-    return 0;
-}
-
-uint32_t allocate_block(fs_context_t* ctx) {
-    if (ctx->sb.free_blocks == 0) return 0;
-    
-    for (uint32_t i = ctx->sb.first_data_block; i < ctx->sb.total_blocks; i++) {
-        uint32_t byte_idx = i / 8;
-        uint32_t bit_idx = i % 8;
-        
-        if (!(ctx->block_bitmap[byte_idx] & (1 << bit_idx))) {
-            ctx->block_bitmap[byte_idx] |= (1 << bit_idx);
-            ctx->sb.free_blocks--;
-            return i;
-        }
+    if (game->state != GAME_STATE_LOADING && game->state != GAME_STATE_PAUSED) {
+        printf("Game is not in a runnable state\n");
+        return -1;
     }
     
-    return 0; // No free blocks
-}
-
-void free_block(fs_context_t* ctx, uint32_t block) {
-    if (block == 0 || block >= ctx->sb.total_blocks) return;
+    game->state = GAME_STATE_RUNNING;
+    printf("Running game: %s\n", game->header.name);
     
-    uint32_t byte_idx = block / 8;
-    uint32_t bit_idx = block % 8;
+    // Game main loop
+    int result = 0;
     
-    if (ctx->block_bitmap[byte_idx] & (1 << bit_idx)) {
-        ctx->block_bitmap[byte_idx] &= ~(1 << bit_idx);
-        ctx->sb.free_blocks++;
-    }
-}
-
-uint32_t allocate_inode(fs_context_t* ctx) {
-    if (ctx->sb.free_inodes == 0) return 0;
-    
-    for (uint32_t i = 0; i < ctx->sb.total_inodes; i++) {
-        uint32_t byte_idx = i / 8;
-        uint32_t bit_idx = i % 8;
-        
-        if (!(ctx->inode_bitmap[byte_idx] & (1 << bit_idx))) {
-            ctx->inode_bitmap[byte_idx] |= (1 << bit_idx);
-            ctx->sb.free_inodes--;
-            return i;
-        }
-    }
-    
-    return 0; // No free inodes
-}
-
-void free_inode(fs_context_t* ctx, uint32_t inode) {
-    if (inode >= ctx->sb.total_inodes) return;
-    
-    uint32_t byte_idx = inode / 8;
-    uint32_t bit_idx = inode % 8;
-    
-    if (ctx->inode_bitmap[byte_idx] & (1 << bit_idx)) {
-        ctx->inode_bitmap[byte_idx] &= ~(1 << bit_idx);
-        ctx->sb.free_inodes++;
-    }
-}
-
-int fs_create_file(fs_context_t* ctx, const char* path, file_type_t type) {
-    // Find parent directory and filename
-    char dir_path[MAX_PATH];
-    char filename[MAX_FILENAME];
-    
-    // Simple path parsing (you'd want more robust parsing)
-    const char* last_slash = strrchr(path, '/');
-    if (last_slash) {
-        strncpy(dir_path, path, last_slash - path);
-        dir_path[last_slash - path] = '\0';
-        strncpy(filename, last_slash + 1, MAX_FILENAME - 1);
+    // Handle built-in games
+    if (strcmp(game->header.name, "Pong") == 0) {
+        result = demo_game_pong(gm, game->data_memory);
+    } else if (strcmp(game->header.name, "Tetris") == 0) {
+        result = demo_game_tetris(gm, game->data_memory);
+    } else if (strcmp(game->header.name, "Snake") == 0) {
+        result = demo_game_snake(gm, game->data_memory);
     } else {
-        strcpy(dir_path, ".");
-        strncpy(filename, path, MAX_FILENAME - 1);
+        // Execute loaded game code
+        if (game->code_memory && game->header.entry_point) {
+            game_main_func main_func = (game_main_func)((char*)game->code_memory + game->header.entry_point);
+            result = main_func(gm, game->data_memory);
+        } else {
+            printf("No executable code found\n");
+            result = -1;
+        }
     }
-    filename[MAX_FILENAME - 1] = '\0';
     
-    // Allocate inode
-    uint32_t inode_num = allocate_inode(ctx);
-    if (inode_num == 0) return -1;
+    // Update play time
+    update_play_time(gm);
     
-    // Initialize inode
-    inode_t* inode = &ctx->inode_table[inode_num];
-    inode->inode_num = inode_num;
-    inode->attributes.type = type;
-    inode->attributes.permissions = 0644;
-    inode->attributes.size = 0;
-    inode->block_count = 0;
+    if (result == 0) {
+        printf("Game completed successfully\n");
+    } else {
+        printf("Game ended with error code: %d\n", result);
+        game->state = GAME_STATE_ERROR;
+    }
     
-    // Add to parent directory (simplified - would need proper directory handling)
-    // For now, just mark as created
+    return result;
+}
+
+int game_stop(game_manager_t* gm) {
+    if (!gm->current_game) {
+        return 0;
+    }
+    
+    game_instance_t* game = gm->current_game;
+    
+    printf("Stopping game: %s\n", game->header.name);
+    
+    // Update statistics
+    update_play_time(gm);
+    gm->total_games_played++;
+    gm->total_play_time += game->play_time;
+    
+    // Free game memory
+    if (game->code_memory) {
+        memory_free(gm->mm, game->code_memory);
+    }
+    if (game->data_memory) {
+        memory_free(gm->mm, game->data_memory);
+    }
+    if (game->stack_memory) {
+        memory_free(gm->mm, game->stack_memory);
+    }
+    
+    // Free game instance
+    memory_free(gm->mm, game);
+    gm->current_game = NULL;
+    
+    printf("Game stopped and memory freed\n");
+    return 0;
+}
+
+int game_save(game_manager_t* gm, int slot) {
+    if (!gm->current_game || slot < 0 || slot >= MAX_SAVE_SLOTS) {
+        return -1;
+    }
+    
+    game_instance_t* game = gm->current_game;
+    
+    // Create save file path
+    char save_path[MAX_PATH];
+    snprintf(save_path, MAX_PATH, "%s_slot_%d.sav", game->save_path, slot);
+    
+    // Create save data
+    save_game_t save_data;
+    save_data.signature = SAVE_SIGNATURE;
+    save_data.game_checksum = game->header.checksum;
+    save_data.save_time = time(NULL);
+    save_data.play_time = game->play_time;
+    save_data.level = game->current_level;
+    save_data.score = game->current_score;
+    save_data.data_size = game->header.save_data_size;
+    
+    // Copy game-specific save data (simplified)
+    memcpy(save_data.save_data, game->data_memory, 
+           game->header.save_data_size < 4096 ? game->header.save_data_size : 4096);
+    
+    // Write save file
+    file_handle_t* save_file = fs_open(gm->fs, save_path, 0x02); // Write mode
+    if (!save_file) {
+        printf("Failed to create save file: %s\n", save_path);
+        return -1;
+    }
+    
+    if (fs_write(gm->fs, save_file, &save_data, sizeof(save_game_t)) != sizeof(save_game_t)) {
+        printf("Failed to write save data\n");
+        fs_close(save_file);
+        return -1;
+    }
+    
+    fs_close(save_file);
+    
+    game->has_save_data = true;
+    printf("Game saved to slot %d\n", slot);
+    return 0;
+}
+
+game_registry_entry_t* game_find_by_name(game_manager_t* gm, const char* name) {
+    for (uint32_t i = 0; i < gm->game_count; i++) {
+        if (strcmp(gm->registry[i].name, name) == 0) {
+            return &gm->registry[i];
+        }
+    }
+    return NULL;
+}
+
+int validate_game_header(game_header_t* header) {
+    if (header->signature != GAME_SIGNATURE) {
+        printf("Invalid game signature\n");
+        return -1;
+    }
+    
+    if (header->version == 0) {
+        printf("Invalid game version\n");
+        return -1;
+    }
+    
+    if (header->code_size == 0 && header->data_size == 0) {
+        printf("Game has no code or data\n");
+        return -1;
+    }
     
     return 0;
 }
 
-file_handle_t* fs_open(fs_context_t* ctx, const char* path, uint8_t mode) {
-    // Find file inode (simplified lookup)
-    // In a real implementation, you'd traverse the directory structure
-    
-    file_handle_t* handle = (file_handle_t*)malloc(sizeof(file_handle_t));
-    if (!handle) return NULL;
-    
-    handle->inode = 1; // Placeholder
-    handle->position = 0;
-    handle->mode = mode;
-    handle->is_open = true;
-    
-    return handle;
+void update_play_time(game_manager_t* gm) {
+    if (gm->current_game) {
+        uint32_t current_time = time(NULL);
+        gm->current_game->play_time = current_time - gm->current_game->start_time;
+    }
 }
 
-int fs_close(file_handle_t* handle) {
-    if (!handle || !handle->is_open) return -1;
+// Demo game implementations
+int demo_game_pong(game_manager_t* gm, void* game_data) {
+    printf("=== PONG ===\n");
+    printf("Classic Pong game simulation\n");
+    printf("Player 1: 5 | Player 2: 3\n");
+    printf("Game Over - Player 1 Wins!\n");
     
-    handle->is_open = false;
-    free(handle);
+    // Simulate game running for a bit
+    for (int i = 0; i < 1000000; i++) {
+        // Simulate game logic
+        if (i % 100000 == 0) {
+            printf("Game frame %d\n", i / 100000);
+        }
+    }
+    
+    gm->current_game->current_score = 5;
+    gm->current_game->current_level = 1;
+    
     return 0;
 }
 
-int fs_read(fs_context_t* ctx, file_handle_t* handle, void* buffer, uint32_t size) {
-    if (!handle || !handle->is_open) return -1;
+int demo_game_tetris(game_manager_t* gm, void* game_data) {
+    printf("=== TETRIS ===\n");
+    printf("Block puzzle game simulation\n");
+    printf("Lines cleared: 15\n");
+    printf("Level: 3\n");
+    printf("Score: 12450\n");
     
-    inode_t* inode = &ctx->inode_table[handle->inode];
-    
-    // Calculate which block contains the current position
-    uint32_t block_idx = handle->position / BLOCK_SIZE;
-    uint32_t block_offset = handle->position % BLOCK_SIZE;
-    
-    uint32_t bytes_read = 0;
-    uint8_t* buf = (uint8_t*)buffer;
-    
-    while (bytes_read < size && handle->position < inode->attributes.size) {
-        if (block_idx >= inode->block_count) break;
-        
-        uint32_t block_num = inode->blocks[block_idx];
-        uint32_t bytes_to_read = BLOCK_SIZE - block_offset;
-        
-        if (bytes_to_read > size - bytes_read) {
-            bytes_to_read = size - bytes_read;
+    // Simulate game running
+    for (int i = 0; i < 1500000; i++) {
+        if (i % 150000 == 0) {
+            printf("Piece %d placed\n", i / 150000);
         }
-        
-        if (bytes_to_read > inode->attributes.size - handle->position) {
-            bytes_to_read = inode->attributes.size - handle->position;
-        }
-        
-        memcpy(buf + bytes_read, 
-               ctx->data_blocks + (block_num * BLOCK_SIZE) + block_offset, 
-               bytes_to_read);
-        
-        bytes_read += bytes_to_read;
-        handle->position += bytes_to_read;
-        block_idx++;
-        block_offset = 0;
     }
     
-    return bytes_read;
+    gm->current_game->current_score = 12450;
+    gm->current_game->current_level = 3;
+    
+    return 0;
 }
 
-int fs_write(fs_context_t* ctx, file_handle_t* handle, const void* buffer, uint32_t size) {
-    if (!handle || !handle->is_open) return -1;
+int demo_game_snake(game_manager_t* gm, void* game_data) {
+    printf("=== SNAKE ===\n");
+    printf("Snake game simulation\n");
+    printf("Length: 8\n");
+    printf("Score: 80\n");
+    printf("Game Over - Snake hit wall!\n");
     
-    inode_t* inode = &ctx->inode_table[handle->inode];
-    
-    // Allocate blocks if needed
-    uint32_t blocks_needed = (handle->position + size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    
-    while (inode->block_count < blocks_needed) {
-        uint32_t new_block = allocate_block(ctx);
-        if (new_block == 0) return -1; // No space
-        
-        if (inode->block_count < 12) {
-            inode->blocks[inode->block_count] = new_block;
+    // Simulate game running
+    for (int i = 0; i < 800000; i++) {
+        if (i % 100000 == 0) {
+            printf("Snake length: %d\n", 3 + i / 100000);
         }
-        // TODO: Handle indirect blocks for larger files
-        
-        inode->block_count++;
     }
     
-    // Write data (similar to read but writing)
-    uint32_t block_idx = handle->position / BLOCK_SIZE;
-    uint32_t block_offset = handle->position % BLOCK_SIZE;
+    gm->current_game->current_score = 80;
+    gm->current_game->current_level = 1;
     
-    uint32_t bytes_written = 0;
-    const uint8_t* buf = (const uint8_t*)buffer;
+    return 0;
+}
+
+int game_list_installed(game_manager_t* gm, game_registry_entry_t* games, int max_games) {
+    int count = 0;
+    for (uint32_t i = 0; i < gm->game_count && count < max_games; i++) {
+        if (gm->registry[i].is_installed) {
+            games[count] = gm->registry[i];
+            count++;
+        }
+    }
+    return count;
+}
+
+int game_scan_directory(game_manager_t* gm, const char* directory) {
+    // This would scan the filesystem for .game files
+    // For now, we'll just return success
+    printf("Scanning directory: %s\n", directory);
+    return 0;
+}
+
+uint32_t calculate_checksum(void* data, uint32_t size) {
+    uint32_t checksum = 0;
+    uint8_t* bytes = (uint8_t*)data;
     
-    while (bytes_written < size) {
-        uint32_t block_num = inode->blocks[block_idx];
-        uint32_t bytes_to_write = BLOCK_SIZE - block_offset;
+    for (uint32_t i = 0; i < size; i++) {
+        checksum += bytes[i];
+        checksum = (checksum << 1) | (checksum >> 31); // Rotate left
+    }
+    
+    return checksum;
+}
+
+int game_system_shutdown(game_manager_t* gm) {
+    // Stop current game if running
+    if (gm->current_game) {
+        game_stop(gm);
+    }
+    
+    // Free framebuffer
+    if (gm->framebuffer) {
+        memory_free(gm->mm, gm->framebuffer);
+    }
+    
+    printf("Game system shutdown complete\n");
+    printf("Total games played: %d\n", gm->total_games_played);
+    printf("Total play time: %d seconds\n", gm->total_play_time);
+    
+    return 0;
+}
+
+// Main function to demonstrate the system
+int main() {
+    printf("=== Gaming OS Console System ===\n");
+    
+    // Initialize file system
+    fs_context_t fs;
+    if (fs_init(&fs, 10000) != 0) {
+        printf("Failed to initialize file system\n");
+        return 1;
+    }
+    
+    if (fs_format(&fs, "GameOS") != 0) {
+        printf("Failed to format file system\n");
+        return 1;
+    }
+    
+    // Initialize memory manager
+    memory_manager_t mm;
+    if (memory_init(&mm, 128 * 1024 * 1024, 0x100000) != 0) {
+        printf("Failed to initialize memory manager\n");
+        return 1;
+    }
+    
+    // Initialize game system
+    game_manager_t gm;
+    if (game_system_init(&gm, &fs, &mm) != 0) {
+        printf("Failed to initialize game system\n");
+        return 1;
+    }
+    
+    // List available games
+    printf("\n=== Available Games ===\n");
+    game_registry_entry_t games[MAX_GAMES];
+    int game_count = game_list_installed(&gm, games, MAX_GAMES);
+    
+    for (int i = 0; i < game_count; i++) {
+        printf("%d. %s (Type: %d)\n", i + 1, games[i].name, games[i].type);
+    }
+    
+    // Demo: Play each game
+    printf("\n=== Game Demo Session ===\n");
+    
+    for (int i = 0; i < game_count; i++) {
+        printf("\n--- Playing %s ---\n", games[i].name);
         
-        if (bytes_to_write > size - bytes_written) {
-            bytes_to_write = size - bytes_written;
+        if (game_load(&gm, games[i].name) == 0) {
+            game_run(&gm);
+            
+            // Save game
+            printf("Saving game...\n");
+            game_save(&gm, 0);
+            
+            game_stop(&gm);
         }
         
-        memcpy(ctx->data_blocks + (block_num * BLOCK_SIZE) + block_offset,
-               buf + bytes_written,
-               bytes_to_write);
-        
-        bytes_written += bytes_to_write;
-        handle->position += bytes_to_write;
-        block_idx++;
-        block_offset = 0;
+        printf("Press Enter to continue...");
+        getchar();
     }
     
-    // Update file size
-    if (handle->position > inode->attributes.size) {
-        inode->attributes.size = handle->position;
-    }
+    // Shutdown
+    game_system_shutdown(&gm);
     
-    return bytes_written;
+    // Show memory statistics
+    uint32_t total, free, fragmentation;
+    memory_get_stats(&mm, &total, &free, &fragmentation);
+    printf("\nMemory Statistics:\n");
+    printf("Total: %d bytes\n", total);
+    printf("Free: %d bytes\n", free);
+    printf("Fragmentation events: %d\n", fragmentation);
+    
+    return 0;
 }
